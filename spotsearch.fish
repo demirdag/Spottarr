@@ -1,7 +1,7 @@
 # spotsearch - search Spottarr (Newznab) and download NZBs
 #   spotsearch s ["query"] [-c cat] [-s size|age] [-r] [-n N] [-a] [-o N] [-t] [-l]
 #   spotsearch b <cat> [options]  browse a whole category
-#   spotsearch g [n ...] [-C cat] [--local]
+#   spotsearch g [n|n-m|n,m ...] [-C cat] [--local]
 #                                 download (no numbers = menu on last search);
 #                                 with SABNZBD_APIKEY set it goes to SABnzbd
 #                                 instead of disk, in the matching category
@@ -261,9 +261,12 @@ function __spotsearch_menu
         return 1
     end
 
+    # select-all acts on what is visible, so type to filter, then Ctrl-A
     set -l picks (__spotsearch_fmt | fzf --multi --reverse --no-sort --height=80% \
         --prompt='nzb> ' \
-        --header='↑/↓ move   Tab mark   Enter download   Esc cancel   (type to filter)')
+        --bind 'ctrl-a:select-all,ctrl-d:deselect-all' \
+        --header='↑/↓ move   Tab mark/unmark   Ctrl-A mark all shown   Ctrl-D unmark all
+Enter download marked (or highlighted)   Esc cancel   type to filter')
     or begin
         echo cancelled
         return 0
@@ -487,10 +490,25 @@ function __spotsearch_get
         __spotsearch_menu $fwd
         return
     end
-    for n in $argv
-        if not string match -qr '^[0-9]+$' -- $n
-            echo "not a result number: $n (usage: spotsearch g <number> ... [-C cat] [--local])" >&2
+    # numbers, ranges and comma lists: 3   1-5   1,4,7-9   (each picked once)
+    set -l nums
+    for spec in (string split , -- $argv)
+        test -z "$spec"; and continue
+        set -l r (string match -r '^([0-9]+)(?:-([0-9]+))?$' -- $spec)
+        if test (count $r) -eq 0
+            echo "not a result number or range: $spec (usage: spotsearch g 3 5 | 1-5 | 1,4,7-9 [-C cat] [--local])" >&2
             return 1
+        end
+        set -l range $r[2]
+        if test -n "$r[3]"
+            if test $r[3] -lt $r[2]
+                echo "backwards range: $spec" >&2
+                return 1
+            end
+            set range (seq $r[2] $r[3])
+        end
+        for n in $range
+            contains -- $n $nums; or set -a nums $n
         end
     end
     __spotsearch_key_ok; or return 1
@@ -502,10 +520,14 @@ function __spotsearch_get
     set -l outdir $PWD
     set -q SPOTARR_NZB_DIR; and set outdir $SPOTARR_NZB_DIR
 
-    for n in $argv
+    set -l sent 0
+    set -l saved 0
+    set -l failed 0
+    for n in $nums
         set -l line (awk -F'\t' -v n=$n '$1==n' $cache)
         if test -z "$line"
             echo "#$n: not in last results" >&2
+            set failed (math $failed + 1)
             continue
         end
         set -l parts (string split \t -- $line)
@@ -522,6 +544,7 @@ function __spotsearch_get
         if not curl -fsS -o $tmp $url; or not grep -q '<nzb' $tmp
             echo "#$n: download failed or not a valid NZB" >&2
             rm -f $tmp
+            set failed (math $failed + 1)
             continue
         end
 
@@ -537,6 +560,7 @@ function __spotsearch_get
             echo "#$n: $title"
             if __spotsearch_push $tmp $title "$sabcat" "$safe.nzb"
                 rm -f $tmp
+                set sent (math $sent + 1)
                 continue
             end
             echo "  keeping it on disk instead" >&2
@@ -545,11 +569,22 @@ function __spotsearch_get
         mkdir -p $outdir
         if mv -f $tmp $out
             echo "saved: $out"
+            set saved (math $saved + 1)
         else
             echo "#$n: could not write $out" >&2
             rm -f $tmp
+            set failed (math $failed + 1)
         end
     end
+
+    if test (count $nums) -gt 1
+        set -l summary
+        test $sent -gt 0; and set -a summary "$sent sent to sabnzbd"
+        test $saved -gt 0; and set -a summary "$saved saved to disk"
+        test $failed -gt 0; and set -a summary "$failed failed"
+        echo "-- "(count $nums)" picked: "(string join ', ' $summary)
+    end
+    test $failed -eq 0
 end
 
 # category tree from the server's t=caps response
@@ -612,7 +647,8 @@ USAGE
                                      (query is optional if you give -c)
   spotsearch b <cat> [options]       browse a whole category, no query needed
   spotsearch g [n ...] [options]     download result number(s) from the last
-                                     search; with no numbers, reopens the menu
+                                     search: 3 5, ranges 1-5, lists 1,4,7-9;
+                                     with no numbers, reopens the menu
   spotsearch cats                   list the categories the server offers
   spotsearch help                    show this help
 
@@ -654,6 +690,8 @@ OPTIONS (for g, and for the menu that s / b / g open)
 MENU KEYS (needs fzf)
   Up / Down     move
   Tab           mark / unmark an entry (pick several)
+  Ctrl-A        mark every entry currently shown (filter first to narrow it)
+  Ctrl-D        unmark everything
   Enter         download the marked entries (or the highlighted one)
   Esc, Ctrl-C   cancel
   (typing)      filter the list by title
@@ -688,6 +726,8 @@ EXAMPLES
   spotsearch s \"matrix\" -c movies | grep -i 2160p  filtered plain list
   spotsearch g                                     reopen menu on last search
   spotsearch g 3 5 8                               download by number
+  spotsearch g 1-10                                download results 1 to 10
+  spotsearch g 1-3,7,12-14 -C games                several, all as games
   spotsearch g 3 -C tv                             download, queue in SABnzbd as tv
   spotsearch g --local                             menu, save only (no SABnzbd)
 
