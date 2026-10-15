@@ -1,12 +1,83 @@
 # spotsearch - search Spottarr (Newznab) and download NZBs
 #   spotsearch s ["query"] [-c cat] [-s size|age] [-r] [-n N] [-a] [-o N] [-t] [-l]
 #   spotsearch b <cat> [options]  browse a whole category
-#   spotsearch g [n ...]          download (no numbers = menu on last search)
+#   spotsearch g [n ...] [-C cat] [--local]
+#                                 download (no numbers = menu on last search);
+#                                 with SABNZBD_APIKEY set it goes to SABnzbd
+#                                 instead of disk, in the matching category
 #   spotsearch cats               list categories the server offers
 #   spotsearch help               full help
 
 function __spotsearch_base
     set -q SPOTARR_URL; and echo $SPOTARR_URL; or echo http://192.168.1.14:8383/newznab
+end
+
+function __spotsearch_sab_base
+    set -q SABNZBD_URL; and echo (string trim -r -c / -- $SABNZBD_URL); or echo http://192.168.1.14:8081
+end
+
+# Newznab category ids (comma-separated) -> SABnzbd category, empty if none fits.
+# Console (1xxx) and PC/Games (4050) are games; the rest of 4xxx is software.
+function __spotsearch_sabcat_for
+    set -l ids (string split , -- $argv[1])
+    for id in $ids
+        if string match -qr '^1[0-9]{3}$' -- $id; or test "$id" = 4050
+            echo games
+            return
+        end
+    end
+    for id in $ids
+        string match -qr '^[2-7][0-9]{3}$' -- $id; or continue
+        switch (string sub -l 1 -- $id)
+            case 2
+                echo movies
+            case 3
+                echo audio
+            case 4
+                echo software
+            case 5
+                echo tv
+            case 6
+                echo erotica
+            case 7
+                echo books
+        end
+        return
+    end
+end
+
+# upload an NZB to SABnzbd (mode=addfile): file, job name, [category], [filename]
+# The key goes to curl on stdin, so it never shows up in the process list.
+function __spotsearch_push
+    set -l file $argv[1]
+    set -l name $argv[2]
+    set -l cat $argv[3]
+    set -l fname $argv[4]
+    test -z "$fname"; and set fname (path basename -- $file)
+
+    set -l args -sS -m 30 -F mode=addfile -F output=json \
+        -F "nzbname=$name" -F "name=@$file;filename=$fname;type=application/x-nzb"
+    test -n "$cat"; and set -a args -F "cat=$cat"
+
+    set -l resp (printf 'form = "apikey=%s"\n' $SABNZBD_APIKEY \
+        | curl -K - $args (__spotsearch_sab_base)/api | string collect)
+    or begin
+        echo "  sabnzbd: request failed ("(__spotsearch_sab_base)")" >&2
+        return 1
+    end
+
+    if string match -qr '"status":\s*true' -- $resp
+        set -l id (string match -r '"nzo_ids":\s*\[\s*"([^"]+)"' -- $resp)[2]
+        set -l msg "  sent to sabnzbd"
+        test -n "$cat"; and set msg "$msg [$cat]"
+        test -n "$id"; and set msg "$msg: $id"
+        echo $msg
+        return 0
+    end
+    set -l err (string match -r '"error":\s*"([^"]*)"' -- $resp)[2]
+    test -z "$err"; and set err (string sub -l 200 -- $resp)
+    echo "  sabnzbd refused it: $err" >&2
+    return 1
 end
 
 function __spotsearch_cache
@@ -169,7 +240,7 @@ function __spotsearch_cat
     return 0
 end
 
-# cache columns: 1 num, 2 epoch, 3 size, 4 day, 5 title, 6 url
+# cache columns: 1 num, 2 epoch, 3 size, 4 day, 5 title, 6 url, 7 newznab cats (a,b)
 # prints the human-readable list (also used as the menu input)
 function __spotsearch_fmt
     awk -F'\t' '
@@ -178,6 +249,7 @@ function __spotsearch_fmt
 end
 
 # fzf menu over the last search; downloads whatever you pick
+# (any arguments are options handed on to __spotsearch_get, e.g. -C tv)
 function __spotsearch_menu
     set -l cache (__spotsearch_cache)
     if not test -s $cache
@@ -205,7 +277,7 @@ function __spotsearch_menu
     for p in $picks
         set -a nums (string replace -r '^\s*(\d+).*' '$1' -- $p)
     end
-    __spotsearch_get $nums
+    __spotsearch_get $argv $nums
 end
 
 function __spotsearch_search
@@ -315,7 +387,7 @@ function __spotsearch_search
         set total (xmllint --xpath "string(//*[local-name()='response']/@total)" $tmp 2>/dev/null)
         test $n -eq 0; and break
 
-        # raw row: epoch, size, day, title, url
+        # raw row: epoch, size, day, title, url, cats
         for i in (seq $n)
             set -l title (xmllint --xpath "string(//item[$i]/title)" $tmp)
 
@@ -338,7 +410,9 @@ function __spotsearch_search
             or set epoch 0
             set -l day (date -d "@$epoch" +%F 2>/dev/null)
             or set day '?'
-            printf '%s\t%s\t%s\t%s\t%s\n' $epoch "$size" $day "$title" "$url" >>$raw
+            set -l cats (xmllint --xpath "//item[$i]/category" $tmp 2>/dev/null \
+                | string match -rag '<category>([0-9]+)</category>' | string join ,)
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' $epoch "$size" $day "$title" "$url" "$cats" >>$raw
             set kept (math $kept + 1)
         end
 
@@ -392,21 +466,41 @@ function __spotsearch_search
     end
 end
 
+# fetch NZBs by result number. With SABNZBD_APIKEY set (and no --local) each
+# one goes to SABnzbd and is only saved to disk if SABnzbd does not take it;
+# otherwise it is saved. No numbers = open the menu.
 function __spotsearch_get
+    argparse 'C/sabcat=' L/local -- $argv
+    or return 1
+
     set -l cache (__spotsearch_cache)
     if not test -s $cache
         echo "no previous search" >&2
         return 1
     end
+
+    # no numbers: pick from the menu, keeping the options given here
     if test (count $argv) -lt 1
-        echo "usage: spotsearch g <number> [number ...]" >&2
-        return 1
+        set -l fwd
+        set -q _flag_sabcat; and set -a fwd -C $_flag_sabcat
+        set -q _flag_local; and set -a fwd --local
+        __spotsearch_menu $fwd
+        return
+    end
+    for n in $argv
+        if not string match -qr '^[0-9]+$' -- $n
+            echo "not a result number: $n (usage: spotsearch g <number> ... [-C cat] [--local])" >&2
+            return 1
+        end
     end
     __spotsearch_key_ok; or return 1
 
+    set -l push 0
+    if not set -q _flag_local; and set -q SABNZBD_APIKEY
+        set push 1
+    end
     set -l outdir $PWD
     set -q SPOTARR_NZB_DIR; and set outdir $SPOTARR_NZB_DIR
-    mkdir -p $outdir
 
     for n in $argv
         set -l line (awk -F'\t' -v n=$n '$1==n' $cache)
@@ -417,16 +511,43 @@ function __spotsearch_get
         set -l parts (string split \t -- $line)
         set -l title $parts[5]
         set -l url $parts[6]
+        set -l cats $parts[7]
         if not string match -q '*apikey=*' -- $url
             set url "$url&apikey=$SPOTARR_APIKEY"
         end
         set -l safe (string replace -ra '[^A-Za-z0-9._()-]' '_' -- $title | string sub -l 120)
         set -l out "$outdir/$safe.nzb"
 
-        if curl -fsS -o $out $url; and grep -q '<nzb' $out
+        set -l tmp (mktemp --suffix=.nzb)
+        if not curl -fsS -o $tmp $url; or not grep -q '<nzb' $tmp
+            echo "#$n: download failed or not a valid NZB" >&2
+            rm -f $tmp
+            continue
+        end
+
+        if test $push -eq 1
+            # -C wins, then the result's own category, then SABNZBD_CAT
+            set -l sabcat
+            if set -q _flag_sabcat
+                set sabcat $_flag_sabcat
+            else
+                set sabcat (__spotsearch_sabcat_for "$cats")
+                test -z "$sabcat"; and set -q SABNZBD_CAT; and set sabcat $SABNZBD_CAT
+            end
+            echo "#$n: $title"
+            if __spotsearch_push $tmp $title "$sabcat" "$safe.nzb"
+                rm -f $tmp
+                continue
+            end
+            echo "  keeping it on disk instead" >&2
+        end
+
+        mkdir -p $outdir
+        if mv -f $tmp $out
             echo "saved: $out"
         else
-            echo "#$n: download failed or not a valid NZB ($out)" >&2
+            echo "#$n: could not write $out" >&2
+            rm -f $tmp
         end
     end
 end
@@ -476,6 +597,11 @@ function __spotsearch_help
     set -q SPOTARR_MAX; and set max $SPOTARR_MAX
     set -l key "NOT SET"
     set -q SPOTARR_APIKEY; and set key set
+    set -l sabkey "not set (NZBs are only saved)"
+    set -q SABNZBD_APIKEY; and set sabkey "set (downloads are sent to SABnzbd)"
+    set -l saburl (__spotsearch_sab_base)
+    set -l sabcat "not set (SABnzbd's default)"
+    set -q SABNZBD_CAT; and set sabcat $SABNZBD_CAT
     set -l fz "NOT INSTALLED (paru -S fzf)"
     type -q fzf; and set fz installed
 
@@ -485,9 +611,9 @@ USAGE
   spotsearch s [\"query\"] [options]   search; opens a menu to pick NZBs
                                      (query is optional if you give -c)
   spotsearch b <cat> [options]       browse a whole category, no query needed
-  spotsearch g [n ...]               download result number(s) from the last
+  spotsearch g [n ...] [options]     download result number(s) from the last
                                      search; with no numbers, reopens the menu
-  spotsearch cats                    list the categories the server offers
+  spotsearch cats                   list the categories the server offers
   spotsearch help                    show this help
 
 OPTIONS (for s and b)
@@ -503,6 +629,27 @@ OPTIONS (for s and b)
   -l, --list           print a plain numbered list instead of the menu
 
   The old style also works: spotsearch s \"hot fuzz\" movies
+
+OPTIONS (for g, and for the menu that s / b / g open)
+  -C, --sabcat <cat>   SABnzbd category for this download (overrides the
+                       automatic one)
+  -L, --local          only save the NZB, do not send it to SABnzbd
+
+  When SABNZBD_APIKEY is set, NZBs go straight to SABnzbd and nothing is
+  written to disk. An NZB is only saved to SPOTARR_NZB_DIR when SABnzbd
+  refuses it or cannot be reached, with --local, or without a key.
+
+  The SABnzbd category follows the result's category:
+    1000 console, 4050 pc games  -> games      2000 movies  -> movies
+    3000 audio                   -> audio      4000 pc/apps -> software
+    5000 tv                      -> tv         6000 xxx     -> erotica
+    7000 books                   -> books
+  Anything else (8000 other) gets SABNZBD_CAT, or SABnzbd's default if
+  that is not set either.
+
+  The menu that opens after s / b always uses the defaults; to pick a
+  category or stay local from the menu, use: spotsearch g -C <cat>   or
+  spotsearch g --local
 
 MENU KEYS (needs fzf)
   Up / Down     move
@@ -541,6 +688,8 @@ EXAMPLES
   spotsearch s \"matrix\" -c movies | grep -i 2160p  filtered plain list
   spotsearch g                                     reopen menu on last search
   spotsearch g 3 5 8                               download by number
+  spotsearch g 3 -C tv                             download, queue in SABnzbd as tv
+  spotsearch g --local                             menu, save only (no SABnzbd)
 
 NOTES
   - The query searches titles AND descriptions and matches ANY word, so
@@ -560,6 +709,9 @@ SETTINGS (universal variables, set once with: set -Ux NAME value)
   SPOTARR_NZB_DIR   where NZBs are saved, currently: $dir
   SPOTARR_LIMIT     default result count, currently: $limit
   SPOTARR_MAX       cap for -n / -a, currently: $max
+  SABNZBD_APIKEY    SABnzbd API key (Config > General), currently: $sabkey
+  SABNZBD_URL       currently: $saburl
+  SABNZBD_CAT       category for results with no match, currently: $sabcat
 
 TOOLS
   fzf: $fz"
@@ -578,11 +730,9 @@ function spotsearch --description 'Search Spottarr and download NZBs'
             test (count $argv) -gt 2; and set rest $argv[3..-1]
             __spotsearch_search -c $argv[2] $rest
         case g get
-            if test (count $argv) -ge 2
-                __spotsearch_get $argv[2..-1]
-            else
-                __spotsearch_menu
-            end
+            set -l rest
+            test (count $argv) -ge 2; and set rest $argv[2..-1]
+            __spotsearch_get $rest
         case cats
             __spotsearch_cats
         case '' help -h --help
@@ -607,3 +757,5 @@ complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s o -
 complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s a -l all
 complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s t -l title
 complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s l -l list
+complete -c spotsearch -n '__fish_seen_subcommand_from g get' -s C -l sabcat -x -a 'tv audio movies software erotica books games' -d 'SABnzbd category'
+complete -c spotsearch -n '__fish_seen_subcommand_from g get' -s L -l local -d 'save only, do not send to SABnzbd'
