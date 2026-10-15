@@ -5,6 +5,8 @@
 #                                 download (no numbers = menu on last search);
 #                                 with SABNZBD_APIKEY set it goes to SABnzbd
 #                                 instead of disk, in the matching category
+#   spotsearch i [options]        interactive: pick categories, collect a
+#                                 basket across them, send it in one go
 #   spotsearch cats               list categories the server offers
 #   spotsearch help               full help
 
@@ -242,10 +244,18 @@ end
 
 # cache columns: 1 num, 2 epoch, 3 size, 4 day, 5 title, 6 url, 7 newznab cats (a,b)
 # prints the human-readable list (also used as the menu input)
+#   __spotsearch_fmt [file] [basket]   default file is the last search; with a
+#   basket file, rows already in it are marked with *
 function __spotsearch_fmt
-    awk -F'\t' '
+    set -l file (__spotsearch_cache)
+    set -q argv[1]; and set file $argv[1]
+    set -l basket
+    set -q argv[2]; and test -s "$argv[2]"; and set basket $argv[2]
+    awk -F'\t' -v mark=(count $basket) '
         function h(b) { if (b >= 1073741824) return sprintf("%.2f GB", b/1073741824); return sprintf("%.0f MB", b/1048576) }
-        { printf "%3d  %s  %9s  %s\n", $1, $4, h($3), $5 }' (__spotsearch_cache)
+        mark && FILENAME == ARGV[1] { inb[$5] = 1; next }
+        mark { printf "%3d %s %s  %9s  %s\n", $1, ($6 in inb ? "*" : " "), $4, h($3), $5; next }
+        { printf "%3d  %s  %9s  %s\n", $1, $4, h($3), $5 }' $basket $file
 end
 
 # fzf menu over the last search; downloads whatever you pick
@@ -379,8 +389,8 @@ function __spotsearch_search
             return 1
         end
 
-        if grep -q '<error' $tmp
-            echo "API error: "(grep -o '<error[^>]*>' $tmp) >&2
+        if command grep -q '<error' $tmp
+            echo "API error: "(command grep -o '<error[^>]*>' $tmp) >&2
             rm -f $tmp $raw
             return 1
         end
@@ -473,10 +483,12 @@ end
 # one goes to SABnzbd and is only saved to disk if SABnzbd does not take it;
 # otherwise it is saved. No numbers = open the menu.
 function __spotsearch_get
-    argparse 'C/sabcat=' L/local -- $argv
+    # --from: read results from another file in cache format (used by the basket)
+    argparse 'C/sabcat=' L/local 'F/from=' -- $argv
     or return 1
 
     set -l cache (__spotsearch_cache)
+    set -q _flag_from; and set cache $_flag_from
     if not test -s $cache
         echo "no previous search" >&2
         return 1
@@ -541,7 +553,7 @@ function __spotsearch_get
         set -l out "$outdir/$safe.nzb"
 
         set -l tmp (mktemp --suffix=.nzb)
-        if not curl -fsS -o $tmp $url; or not grep -q '<nzb' $tmp
+        if not curl -fsS -o $tmp $url; or not command grep -q '<nzb' $tmp
             echo "#$n: download failed or not a valid NZB" >&2
             rm -f $tmp
             set failed (math $failed + 1)
@@ -587,8 +599,9 @@ function __spotsearch_get
     test $failed -eq 0
 end
 
-# category tree from the server's t=caps response
-function __spotsearch_cats
+# the server's category tree (t=caps) as rows: kind<TAB>id<TAB>name,
+# kind being 'category' (top level) or 'subcat'
+function __spotsearch_caprows
     __spotsearch_key_ok; or return 1
     set -l tmp (mktemp)
     set -l base (__spotsearch_base)
@@ -606,20 +619,445 @@ function __spotsearch_cats
         return 1
     end
 
-    printf '%-6s %s\n' ID NAME
     for i in (seq $n)
         set -l row (xmllint --xpath "concat(name((//categories//*[@id])[$i]),'|',(//categories//*[@id])[$i]/@id,'|',(//categories//*[@id])[$i]/@name)" $tmp)
-        set -l f (string split '|' -- $row)
+        string split '|' -- $row | string join \t
+    end
+    rm -f $tmp
+end
+
+# category tree from the server's t=caps response
+function __spotsearch_cats
+    set -l rows (__spotsearch_caprows)
+    or return 1
+
+    printf '%-6s %s\n' ID NAME
+    for row in $rows
+        set -l f (string split \t -- $row)
         if test "$f[1]" = subcat
             printf '  %-6s %s\n' $f[2] $f[3]
         else
             printf '%-6s %s\n' $f[2] $f[3]
         end
     end
-    rm -f $tmp
     echo
     echo "use with: spotsearch s \"query\" -c <id>[,<id>...]   or   spotsearch b <id|name>"
     echo "(a parent id also matches its subcategories)"
+end
+
+# ---------- interactive mode: browse categories, collect a basket, send ----------
+# The basket lives next to the search cache, one row per pick, in cache format
+# without the number column (epoch, size, day, title, url, cats). It survives
+# quitting, so 'spotsearch i' carries on where you left off.
+
+function __spotsearch_basket
+    echo (path dirname (__spotsearch_cache))/spotsearch.basket
+end
+
+function __spotsearch_basket_count
+    set -l basket (__spotsearch_basket)
+    test -s $basket; and count <$basket; or echo 0
+end
+
+# basket rows numbered 1..N into a temp file (cache format); prints its path
+function __spotsearch_basket_numbered
+    set -l tmp (mktemp)
+    awk -F'\t' -v OFS='\t' '{ print NR, $0 }' (__spotsearch_basket) >$tmp
+    echo $tmp
+end
+
+# add result numbers from a cache-format file; the url is the identity, so a
+# spot already in the basket is not added twice. Prints how many were added.
+function __spotsearch_basket_add
+    set -l from $argv[1]
+    set -l basket (__spotsearch_basket)
+    touch $basket
+    set -l tmp (mktemp)
+    awk -F'\t' -v nums="$argv[2..-1]" '
+        BEGIN { split(nums, a, " "); for (i in a) want[a[i]] = 1 }
+        FILENAME == ARGV[1] { have[$5] = 1; next }
+        ($1 in want) && !($6 in have) { have[$6] = 1; print substr($0, index($0, "\t") + 1) }
+    ' $basket $from >$tmp
+    count <$tmp
+    command cat $tmp >>$basket
+    rm -f $tmp
+end
+
+# show the basket; whatever is picked here is removed from it
+function __spotsearch_basket_edit
+    set -l n (__spotsearch_basket_count)
+    if test $n -eq 0
+        echo "the basket is empty"
+        return 0
+    end
+    set -l tmp (__spotsearch_basket_numbered)
+    set -l picks (__spotsearch_fmt $tmp | fzf --multi --reverse --no-sort --height=80% \
+        --prompt='remove> ' \
+        --bind 'ctrl-a:select-all,ctrl-d:deselect-all' \
+        --header="basket: $n   Tab mark   Ctrl-A mark all shown   Enter REMOVE marked (or highlighted)
+Esc back without removing   type to filter")
+    if test (count $picks) -eq 0
+        rm -f $tmp
+        return 0
+    end
+    set -l nums
+    for p in $picks
+        set -a nums (string replace -r '^\s*(\d+).*' '$1' -- $p)
+    end
+    set -l basket (__spotsearch_basket)
+    awk -F'\t' -v nums="$nums" '
+        BEGIN { split(nums, a, " "); for (i in a) drop[a[i]] = 1 }
+        !($1 in drop) { print substr($0, index($0, "\t") + 1) }
+    ' $tmp >$basket
+    rm -f $tmp
+    echo "removed "(count $nums)" (basket: "(__spotsearch_basket_count)")"
+end
+
+# send everything in the basket; options go on to __spotsearch_get (-C, --local).
+# Whatever fails to download stays in the basket for another try.
+function __spotsearch_basket_send
+    set -l n (__spotsearch_basket_count)
+    if test $n -eq 0
+        echo "the basket is empty"
+        return 0
+    end
+    set -l tmp (__spotsearch_basket_numbered)
+    set -l keep
+    for i in (seq $n)
+        __spotsearch_get $argv --from $tmp $i; or set -a keep $i
+    end
+    set -l basket (__spotsearch_basket)
+    awk -F'\t' -v nums="$keep" '
+        BEGIN { split(nums, a, " "); for (i in a) keep[a[i]] = 1 }
+        ($1 in keep) { print substr($0, index($0, "\t") + 1) }
+    ' $tmp >$basket
+    rm -f $tmp
+    if test (count $keep) -gt 0
+        echo "-- "(math $n - (count $keep))" of $n done; "(count $keep)" left in the basket (failed to download)"
+    else
+        echo "-- all $n done, basket emptied"
+    end
+end
+
+# ---- spots per category, so the menu can hide empty ones ----
+# Kept in spotsearch.counts (id<TAB>total) next to the search cache and
+# refreshed when older than SPOTARR_COUNT_TTL hours (default 12).
+
+function __spotsearch_counts_file
+    echo (path dirname (__spotsearch_cache))/spotsearch.counts
+end
+
+# how long ago the counts were taken, e.g. 5m or 3h
+function __spotsearch_counts_age
+    set -l file (__spotsearch_counts_file)
+    if not test -e $file
+        echo never
+        return
+    end
+    set -l s (path mtime --relative $file)
+    if test $s -lt 3600
+        echo (math -s0 $s / 60)m
+    else
+        echo (math -s0 $s / 3600)h
+    end
+end
+
+#   __spotsearch_counts_refresh [-f] <cat id> ...   (-f: recount even if fresh)
+function __spotsearch_counts_refresh
+    argparse f/force -- $argv
+    or return 1
+    set -l file (__spotsearch_counts_file)
+    set -l ttl 12
+    set -q SPOTARR_COUNT_TTL; and set ttl $SPOTARR_COUNT_TTL
+    if not set -q _flag_force; and test -s $file
+        test (path mtime --relative $file) -lt (math "$ttl * 3600"); and return 0
+    end
+
+    echo "counting spots in "(count $argv)" categories ..." >&2
+    set -l dir (mktemp -d)
+    set -l base (__spotsearch_base)
+    # one limit=1 search per category, 8 at a time; only the total is used
+    printf '%s\n' $argv | xargs -P 8 -I '{}' curl -fsS -m 30 -o "$dir/{}" -G "$base/api" \
+        --data-urlencode t=search --data-urlencode 'cat={}' --data-urlencode limit=1 \
+        --data-urlencode "apikey=$SPOTARR_APIKEY" 2>/dev/null
+
+    set -l out (mktemp)
+    set -l failed 0
+    for id in $argv
+        set -l t
+        test -s $dir/$id; and set t (string match -rg 'total="([0-9]+)"' <$dir/$id)[1]
+        if test -n "$t"
+            printf '%s\t%s\n' $id $t >>$out
+        else
+            set failed (math $failed + 1)
+        end
+    end
+    rm -rf $dir
+    test $failed -gt 0; and echo "  could not count $failed categories, they stay visible" >&2
+    if test -s $out
+        mv -f $out $file
+    else
+        rm -f $out
+    end
+end
+
+# menu lines action<TAB>id<TAB>label from caps rows: empty categories left out,
+# the others labelled with their count. Uncounted ones are shown without one.
+function __spotsearch_catlines
+    set -l cids
+    set -l cnts
+    set -l file (__spotsearch_counts_file)
+    if test -s $file
+        for line in (command cat $file)
+            set -l f (string split \t -- $line)
+            set -a cids $f[1]
+            set -a cnts $f[2]
+        end
+    end
+
+    set -l parent
+    for row in $argv
+        set -l f (string split \t -- $row)
+        test "$f[2]" = 0; and continue # 'Reserved'
+        set -l label $f[3]
+        if test "$f[1]" = subcat
+            set label "$parent / $f[3]"
+        else
+            set parent $f[3]
+        end
+        set -l i (contains -i -- $f[2] $cids)
+        if test -n "$i"
+            test $cnts[$i] -eq 0; and continue
+            set label "$label  ("(string replace -ra '(\d)(?=(\d{3})+$)' '$1,' -- $cnts[$i])")"
+        end
+        printf 'cat\t%s\t%-6s %s\n' $f[2] $f[2] $label
+    end
+end
+
+# quote one argument for sh
+function __spotsearch_shq
+    printf "'%s'" (string replace -a "'" "'\\''" -- $argv[1])
+end
+
+# fzf's Ctrl-S: search one category on the server, print the list for fzf
+#   __spotsearch_reload <cat id> <query> [search options...]
+#
+# The result list shows one page (-n entries) at a time. Where we are is kept in
+# spotsearch.page, one value per line: id, label, query, offset, limit, total,
+# then the search options. fzf's keys call __spotsearch_page through sh + fish.
+
+function __spotsearch_page_file
+    echo (path dirname (__spotsearch_cache))/spotsearch.page
+end
+
+# fetch one page into the search cache and remember where we are
+#   __spotsearch_page_load <cat id> <label> <query> <offset> [search options...]
+function __spotsearch_page_load
+    set -l id $argv[1]
+    set -l label $argv[2]
+    set -l query $argv[3]
+    set -l offset $argv[4]
+    set -e argv[1..4]
+    set -l opts $argv
+
+    set -l limit 50
+    set -q SPOTARR_LIMIT; and set limit $SPOTARR_LIMIT
+    set -l i (contains -i -- -n $opts); and set limit $opts[(math $i + 1)]
+
+    set -l q
+    test -n "$query"; and set q $query
+    # keep stderr (it carries "fetched N of TOTAL"), drop the printed list
+    set -l msg (__spotsearch_search $q -c $id -o $offset -l $opts 2>&1 >/dev/null)
+    set -l st $status
+    test $st -ne 0; and printf '%s\n' $msg >&2
+
+    set -l cache (__spotsearch_cache)
+    set -l got 0
+    test -s $cache; and set got (count <$cache)
+    set -l total (string match -rg 'of (\d+) matches' -- $msg)[1]
+    test -z "$total"; and set total (math $offset + $got)
+
+    set -l pagefile (__spotsearch_page_file)
+    printf '%s\n' $id $label $query $offset $limit $total $opts >$pagefile
+    return $st
+end
+
+#   __spotsearch_page list | prompt | next <selfile> | prev <selfile> | search <selfile> <query>
+# next/prev/search first put whatever is marked (fzf's {+f} file) into the
+# basket, because fzf forgets marks when the list reloads.
+function __spotsearch_page
+    set -l s (command cat (__spotsearch_page_file))
+    set -l id $s[1]
+    set -l label $s[2]
+    set -l query $s[3]
+    set -l offset $s[4]
+    set -l limit $s[5]
+    set -l total $s[6]
+    set -l opts
+    test (count $s) -ge 7; and set opts $s[7..-1]
+    set -l cache (__spotsearch_cache)
+
+    switch $argv[1]
+        case list
+            test -s $cache; and __spotsearch_fmt $cache (__spotsearch_basket)
+            return 0
+        case prompt
+            set -l p "$label"
+            test -n "$query"; and set p "$p [$query]"
+            if test $total -gt 0
+                set p "$p p"(math -s0 "$offset / $limit + 1")"/"(math -s0 "($total + $limit - 1) / $limit")
+            else
+                set p "$p (no matches)"
+            end
+            echo "$p · basket "(__spotsearch_basket_count)"> "
+            return 0
+    end
+
+    # commit marks before the list changes
+    if test -n "$argv[2]"; and test "$FZF_SELECT_COUNT" -gt 0 2>/dev/null
+        set -l nums
+        for line in (command cat $argv[2])
+            set -a nums (string replace -r '^\s*(\d+).*' '$1' -- $line)
+        end
+        test (count $nums) -gt 0; and __spotsearch_basket_add $cache $nums >/dev/null
+    end
+
+    switch $argv[1]
+        case next
+            test (math $offset + $limit) -lt $total; or return 0
+            __spotsearch_page_load $id $label $query (math $offset + $limit) $opts
+        case prev
+            test $offset -gt 0; or return 0
+            set -l o (math $offset - $limit)
+            test $o -lt 0; and set o 0
+            __spotsearch_page_load $id $label $query $o $opts
+        case search
+            __spotsearch_page_load $id $label "$argv[3]" 0 $opts
+    end
+end
+
+function __spotsearch_interactive
+    argparse 's/sort=' 'n/limit=' r/reverse a/all t/title 'C/sabcat=' L/local -- $argv
+    or return 1
+    __spotsearch_key_ok; or return 1
+    if not type -q fzf
+        echo "interactive mode needs fzf (paru -S fzf)" >&2
+        return 1
+    end
+
+    # options for each search, and for sending
+    set -l searchopts
+    set -q _flag_sort; and set -a searchopts -s $_flag_sort
+    set -q _flag_limit; and set -a searchopts -n $_flag_limit
+    set -q _flag_reverse; and set -a searchopts -r
+    set -q _flag_all; and set -a searchopts -a
+    set -q _flag_title; and set -a searchopts -t
+    set -l getopts
+    set -q _flag_sabcat; and set -a getopts -C $_flag_sabcat
+    set -q _flag_local; and set -a getopts --local
+
+    set -l rows (__spotsearch_caprows)
+    or return 1
+    set -l ids
+    for row in $rows
+        set -a ids (string split \t -- $row)[2]
+    end
+    __spotsearch_counts_refresh $ids
+    set -l catlines (__spotsearch_catlines $rows)
+
+    set -l cache (__spotsearch_cache)
+    set -l basket (__spotsearch_basket)
+    set -l sendto SABnzbd
+    if set -q _flag_local; or not set -q SABNZBD_APIKEY
+        set sendto disk
+    end
+
+    while true
+        set -l n (__spotsearch_basket_count)
+        set -l actions
+        if test $n -gt 0
+            set -a actions "send\t-\t>> send the basket ($n) to $sendto"
+            set -a actions "edit\t-\t>> view / edit the basket ($n)"
+            set -a actions "clear\t-\t>> empty the basket"
+        end
+        set -a actions "recount\t-\t>> recount categories (counted "(__spotsearch_counts_age)" ago)"
+        set -a actions "quit\t-\t>> quit"
+
+        set -l choice (begin; printf '%b\n' $actions; printf '%s\n' $catlines; end \
+            | fzf --reverse --no-sort --height=80% --delimiter='\t' --with-nth=3 \
+                --prompt='category> ' \
+                --header="basket: $n   Enter pick a category or action   Esc quit   type to filter
+empty categories are hidden; (n) = spots in it")
+        or break
+        set -l f (string split \t -- $choice)
+
+        switch $f[1]
+            case quit
+                break
+            case recount
+                __spotsearch_counts_refresh -f $ids
+                set catlines (__spotsearch_catlines $rows)
+            case send
+                __spotsearch_basket_send $getopts
+            case edit
+                __spotsearch_basket_edit
+            case clear
+                read -l -P "empty the basket ($n)? [y/N] " yn
+                if string match -qi 'y*' -- "$yn"
+                    : >$basket
+                    echo "basket emptied"
+                end
+            case cat
+                set -l id $f[2]
+                set -l label (string replace -r '^\S+\s+' '' -- $f[3] | string replace -r '\s+\([0-9,]+\)$' '' | string trim)
+
+                # open on the newest page straight away
+                __spotsearch_page_load $id $label '' 0 $searchopts
+                or continue
+                if not test -s $cache
+                    echo "nothing in $label"
+                    continue
+                end
+
+                # Typing filters the page locally. Ctrl-F/Ctrl-B page through the
+                # category, Ctrl-S searches all of it for the typed text. Those
+                # run through sh (fzf) and call back into this file via fish.
+                set -l F "fish --no-config -c "(__spotsearch_shq "source "(string escape -- (functions --details spotsearch))"; __spotsearch_page \$argv")" --"
+                set -l show "+deselect-all+reload($F list)+transform-prompt($F prompt)"
+                set -l before (__spotsearch_basket_count)
+
+                set -l picks (__spotsearch_page list | fzf --multi --reverse --no-sort --height=80% \
+                    --with-shell 'sh -c' \
+                    --prompt=(__spotsearch_page prompt) \
+                    --bind 'ctrl-a:select-all,ctrl-d:deselect-all' \
+                    --bind 'result:first' \
+                    --bind "ctrl-f:execute-silent($F next {+f})$show" \
+                    --bind "ctrl-b:execute-silent($F prev {+f})$show" \
+                    --bind "ctrl-s:execute-silent($F search {+f} {q})$show+clear-query" \
+                    --header="Tab mark   Ctrl-A mark all shown   Ctrl-D unmark all   * = in basket
+Ctrl-F next page   Ctrl-B previous page   typing filters this page
+Ctrl-S search all of $label for what you typed (empty: newest again)
+Enter add marked (or highlighted) to the basket   Esc back
+(marks also go into the basket when you change page or search)")
+
+                set -l nums
+                for p in $picks
+                    set -a nums (string replace -r '^\s*(\d+).*' '$1' -- $p)
+                end
+                test (count $nums) -gt 0; and __spotsearch_basket_add $cache $nums >/dev/null
+                set -l added (math (__spotsearch_basket_count) - $before)
+                if test $added -gt 0
+                    echo "added $added to the basket, basket: "(__spotsearch_basket_count)
+                else if test (count $nums) -gt 0
+                    echo "already in the basket"
+                end
+        end
+    end
+
+    set -l n (__spotsearch_basket_count)
+    if test $n -gt 0
+        echo "basket kept with $n item(s): 'spotsearch i' to carry on or send it"
+    end
 end
 
 function __spotsearch_help
@@ -649,7 +1087,10 @@ USAGE
   spotsearch g [n ...] [options]     download result number(s) from the last
                                      search: 3 5, ranges 1-5, lists 1,4,7-9;
                                      with no numbers, reopens the menu
-  spotsearch cats                   list the categories the server offers
+  spotsearch i [options]             interactive: pick a category, mark
+                                     results, go to the next category, mark
+                                     more, then send the whole basket
+  spotsearch cats                    list the categories the server offers
   spotsearch help                    show this help
 
 OPTIONS (for s and b)
@@ -699,6 +1140,34 @@ MENU KEYS (needs fzf)
   The menu opens when output goes to a terminal. When piped (| grep ...) or
   with -l you get the plain numbered list instead.
 
+INTERACTIVE MODE (spotsearch i, needs fzf)
+  1. Pick a category (type to filter, e.g. 'games' or 'uhd'). Empty
+     categories are hidden and the rest show how many spots they hold;
+     the counts are refreshed every SPOTARR_COUNT_TTL hours, or with
+     '>> recount categories'. (Spottarr files every game, Switch too,
+     under PC / Games, so the Console categories are always empty.)
+  2. The newest page of that category opens straight away (-n entries per
+     page, default $limit). The prompt shows the page, e.g. p1/42.
+       Ctrl-F / Ctrl-B   next / previous page
+       typing            filters the page you are on
+       Ctrl-S            search the WHOLE category on the server for what
+                         you typed; the matches are paged the same way.
+                         Ctrl-S with nothing typed: newest again.
+  3. Mark results (Tab, Ctrl-A) and press Enter: they go into the basket.
+     Marks also go into the basket when you change page or search, so you
+     can mark on several pages. Esc goes back (marks on the page you are
+     on are not added). Results already in the basket show a *.
+  4. Back at the category list, pick another category and repeat.
+  5. At the top of the category list:
+       >> send the basket     download everything and send it to SABnzbd
+       >> view / edit         mark entries and Enter to remove them
+       >> empty the basket
+  Esc or '>> quit' leaves; the basket is kept (~/.cache/spotsearch.basket)
+  for the next 'spotsearch i'. Anything that fails to download stays in it.
+
+  Options: -n -a -s -r -t apply to every search; -C and --local apply when
+  sending (without -C each item gets its own SABnzbd category).
+
 CATEGORIES
   Run 'spotsearch cats' to see exactly what your server offers. Any ID works
   (-c 2045, -c 2040,2045); a parent ID also matches its subcategories.
@@ -728,6 +1197,8 @@ EXAMPLES
   spotsearch g 3 5 8                               download by number
   spotsearch g 1-10                                download results 1 to 10
   spotsearch g 1-3,7,12-14 -C games                several, all as games
+  spotsearch i                                     interactive basket mode
+  spotsearch i -n 200 -s age                       200 newest per category
   spotsearch g 3 -C tv                             download, queue in SABnzbd as tv
   spotsearch g --local                             menu, save only (no SABnzbd)
 
@@ -752,6 +1223,7 @@ SETTINGS (universal variables, set once with: set -Ux NAME value)
   SABNZBD_APIKEY    SABnzbd API key (Config > General), currently: $sabkey
   SABNZBD_URL       currently: $saburl
   SABNZBD_CAT       category for results with no match, currently: $sabcat
+  SPOTARR_COUNT_TTL hours before category counts are refreshed (default 12)
 
 TOOLS
   fzf: $fz"
@@ -773,6 +1245,10 @@ function spotsearch --description 'Search Spottarr and download NZBs'
             set -l rest
             test (count $argv) -ge 2; and set rest $argv[2..-1]
             __spotsearch_get $rest
+        case i interactive
+            set -l rest
+            test (count $argv) -ge 2; and set rest $argv[2..-1]
+            __spotsearch_interactive $rest
         case cats
             __spotsearch_cats
         case '' help -h --help
@@ -787,15 +1263,15 @@ end
 
 set -g __spotsearch_catnames movies movies-foreign movies-other movies-sd movies-hd movies-uhd movies-bluray movies-3d tv tv-foreign tv-sd tv-hd tv-uhd tv-other tv-sport tv-anime tv-doc audio mp3 audio-video audiobook lossless podcast apps pc 0day iso mac mobile-other pc-games games ios android console nds psp wii switch xbox xbox360 wiiware xbox360-dlc ps3 xbox-one ps4 xxx xxx-dvd xxx-wmv xxx-xvid xxx-x264 xxx-pack xxx-imgset xxx-other books mags ebook comics books-other other misc custom
 
-complete -c spotsearch -f -n __fish_use_subcommand -a 's b g cats help' -d 'search / browse / get / categories / help'
+complete -c spotsearch -f -n __fish_use_subcommand -a 's b g i cats help' -d 'search / browse / get / interactive / categories / help'
 complete -c spotsearch -n '__fish_seen_subcommand_from b browse' -f -a "$__spotsearch_catnames"
-complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s s -l sort -x -a 'size age'
+complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse i interactive' -s s -l sort -x -a 'size age'
 complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s c -l cat -x -a "$__spotsearch_catnames"
-complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s r -l reverse
-complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s n -l limit -x
+complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse i interactive' -s r -l reverse
+complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse i interactive' -s n -l limit -x
 complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s o -l offset -x
-complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s a -l all
-complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s t -l title
+complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse i interactive' -s a -l all
+complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse i interactive' -s t -l title
 complete -c spotsearch -n '__fish_seen_subcommand_from s search b browse' -s l -l list
-complete -c spotsearch -n '__fish_seen_subcommand_from g get' -s C -l sabcat -x -a 'tv audio movies software erotica books games' -d 'SABnzbd category'
-complete -c spotsearch -n '__fish_seen_subcommand_from g get' -s L -l local -d 'save only, do not send to SABnzbd'
+complete -c spotsearch -n '__fish_seen_subcommand_from g get i interactive' -s C -l sabcat -x -a 'tv audio movies software erotica books games' -d 'SABnzbd category'
+complete -c spotsearch -n '__fish_seen_subcommand_from g get i interactive' -s L -l local -d 'save only, do not send to SABnzbd'
